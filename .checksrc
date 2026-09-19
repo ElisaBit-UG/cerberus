@@ -1,0 +1,15 @@
+#!/bin/bash
+# .checksrc — was "gruen" fuer DIESES Repo (das Harness selbst) heisst.
+set -u
+rc=0
+# JS-Syntax
+while IFS= read -r -d '' f; do node --check "$f" || { echo "JS-SYNTAX $f"; rc=1; }; done < <(git ls-files -z '*.js')
+# Shell-Syntax (+ CRLF-Fruehwarnung)
+while IFS= read -r -d '' f; do
+  grep -q $'\r' "$f" && { echo "CRLF $f (autocrlf? siehe .gitattributes)"; rc=1; continue; }
+  bash -n "$f" || { echo "BASH-SYNTAX $f"; rc=1; }
+done < <(git ls-files -z '*.sh' 'bin/checks-run' '.checksrc' '.checksrc.example')
+# Ende-zu-Ende: das Harness gegen sich selbst (installiert in ein Wegwerf-HOME, faehrt den Selbsttest)
+TMPH="$(mktemp -d)"; trap 'rm -rf "$TMPH"' EXIT
+if HOME="$TMPH" bash install.sh >/dev/null 2>&1; then echo "selftest: gruen"; else echo "SELFTEST ROT"; rc=1; fi
+exit $rc

@@ -1,0 +1,7 @@
+# Bash bricht an CRLF; Git for Windows checkt mit autocrlf=true Textdateien als CRLF aus. Hier LF erzwingen.
+*.sh          text eol=lf
+bin/checks-run text eol=lf
+bin/journal   text eol=lf
+.checksrc     text eol=lf
+.checksrc.example text eol=lf
+*.js          text eol=lf

@@ -1,0 +1,517 @@
+#!/usr/bin/env node
+/**
+ * journal — der Zustand, der einen Prozesstod überlebt.
+ *
+ * Anlass: Bis heute hielt RUNNING.md nur ein Statuswort (geplant/läuft/
+ * wartet-abnahme). Wo eine Aufgabe INNERLICH stand, war nirgends festgehalten.
+ * Stirbt der Prozess mitten in Schritt 3, fängt der nächste Lauf von vorn an —
+ * und Arbeit von Subagenten, die nie zurückkamen, war restlos weg (09.09.:
+ * zwei Agenten, sechs Stunden, kein einziges Artefakt).
+ *
+ * Drei Schreibarten, bewusst getrennt, weil sie unterschiedlich altern:
+ *
+ *   checkpoint.json    ÜBERSCHRIEBEN — wo die Ausführung gerade steht.
+ *                      Immer nur der aktuelle Stand, nie Historie.
+ *   history.jsonl      ANGEHÄNGT, nie umgeschrieben — was passiert ist.
+ *                      Macht Übergänge nachvollziehbar und prüfbar.
+ *   commitments.jsonl  EINMAL EINGEFÜGT, dann endgültig — Wirkungen nach aussen.
+ *                      Ein Idempotenz-Schlüssel verhindert, dass ein Wiederholungs-
+ *                      versuch dieselbe Mail zweimal sendet oder zweimal deployt.
+ *
+ * Die Trennung ist der Punkt: Ein Checkpoint darf überschrieben werden, weil er
+ * nur die Position hält. Historie darf es nie, sonst verliert man die Spur. Und
+ * eine bereits eingetretene Wirkung darf sich nicht wiederholen lassen — deshalb
+ * ist commit-effect die einzige Operation, die einen Fehlercode liefert, wenn
+ * der Schlüssel schon existiert.
+ *
+ * Aufrufe:
+ *   journal start <run_id> [beschreibung]
+ *   journal checkpoint <run_id> --schritt N --status S [--naechster T] [--notiz N]
+ *   journal event <run_id> <text> [--art art]
+ *   journal effect <run_id> --key K --was W          exit 0 = neu, exit 3 = schon geschehen
+ *   journal repair <run_id> [--max 3] [--grund G]    exit 0 = weiter, exit 4 = Budget erschöpft
+ *   journal escalate <run_id> --grund G              Abbruch mit Spur
+ *   journal artefakt <run_id> --pfad P --von AGENT   Übergabe registrieren
+ *   journal show <run_id>                            Stand lesbar
+ *   journal resume <run_id>                          was ein neuer Prozess braucht
+ *   journal list                                     offene Läufe
+ */
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+
+const STATE = process.env.CLAUDE_HARNESS_STATE || path.join(os.homedir(), '.claude', 'state');
+const RUNS = path.join(STATE, 'runs');
+
+function laufDir(runId) {
+  const d = path.join(RUNS, runId);
+  // Defense-in-Depth zusaetzlich zu pruefeRunId: der aufgeloeste Pfad MUSS ein direktes
+  // Kind von RUNS sein — sonst wuerde ein Lauf (z.B. per '..') aus runs/ ausbrechen.
+  if (path.dirname(path.resolve(d)) !== path.resolve(RUNS)) {
+    fehler(`run_id verlaesst den runs-Ordner: ${JSON.stringify(runId)}`, 64);
+  }
+  return d;
+}
+function pfade(runId) {
+  const d = laufDir(runId);
+  return {
+    dir: d,
+    checkpoint: path.join(d, 'checkpoint.json'),
+    history: path.join(d, 'history.jsonl'),
+    commitments: path.join(d, 'commitments.jsonl'),
+  };
+}
+
+function jetzt() { return new Date().toISOString(); }
+
+function fehler(text, code = 1) {
+  process.stderr.write(text.endsWith('\n') ? text : text + '\n');
+  process.exit(code);
+}
+
+// Ein run_id darf keine Pfadanteile enthalten — sonst schreibt ein Tippfehler
+// (oder ein Prompt) irgendwohin ins Dateisystem. '.' und '..' bestehen zwar aus
+// erlaubten Zeichen, sind aber genau solche Pfadanteile ('..' bricht aus runs/ aus,
+// '.' kollidiert in runs/ selbst) — deshalb ausdruecklich ablehnen.
+function pruefeRunId(runId) {
+  if (!runId || !/^[A-Za-z0-9._-]{1,120}$/.test(runId) || runId === '.' || runId === '..') {
+    fehler(`ungültige run_id: ${JSON.stringify(runId)} (erlaubt: A-Z a-z 0-9 . _ -, nicht "." oder "..")`, 64);
+  }
+  return runId;
+}
+
+function anhaengen(datei, obj) {
+  fs.mkdirSync(path.dirname(datei), { recursive: true });
+  fs.appendFileSync(datei, JSON.stringify(obj) + '\n');
+}
+
+// ── Nebenläufigkeit ──────────────────────────────────────────────────────────
+// Solange genau ein Lauf zur Zeit lief, war ungesperrtes read-modify-write
+// unauffällig. Im Schwarm bricht es genau an den zwei Stellen, die ausdrücklich
+// Sicherheitszusagen sind: `repair` verliert Inkremente (das 3er-Budget wird
+// durch Parallelität aushebelbar) und `effect` hat ein TOCTOU (die Mahnung geht
+// zweimal raus). Das Sperrmuster nutzt mkdir: atomar, auch über Prozessgrenzen.
+
+// Nur für Tests: verbreitert das Fenster zwischen Lesen und Schreiben. Ohne das
+// bestand der TOCTOU-Test auch gegen den fehlerhaften Code, weil fünf Prozesse
+// nicht eng genug starten — ein Test, der gegen den Fehler besteht, ist wertlos.
+const TEST_LUECKE_MS = Number(process.env.JOURNAL_TEST_LUECKE_MS || 0);
+function testLuecke() {
+  if (TEST_LUECKE_MS > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, TEST_LUECKE_MS);
+}
+
+const SPERRE_VERWAIST_S = Number(process.env.JOURNAL_SPERRE_VERWAIST_S || 300);
+
+// Ein Prozess kann die Sperre per fehler() -> process.exit VERLASSEN, das ueberspringt
+// jedes finally. Damit so ein Ausstieg (z.B. "kein Lauf X") die Sperre nicht liegen laesst
+// — der naechste Aufruf muesste sonst bis zum Verwaist-Timeout warten — merken wir die
+// gehaltene Sperre und raeumen sie im 'exit'-Handler ab.
+let gehalteneSperre = null;
+process.on('exit', () => { if (gehalteneSperre) { try { fs.rmdirSync(gehalteneSperre); } catch { } } });
+
+/**
+ * Führt fn unter der Sperre des Laufs aus. Eine verwaiste Sperre (Prozess
+ * gestorben, bevor er sie freigab) wird nach SPERRE_VERWAIST_S gebrochen —
+ * sonst legt ein einziger Absturz den Lauf für immer still.
+ */
+function mitSperre(runId, wartetS, fn) {
+  const dir = laufDir(runId);
+  fs.mkdirSync(dir, { recursive: true });
+  const sperre = path.join(dir, '.lock');
+  const bis = Date.now() + wartetS * 1000;
+
+  for (;;) {
+    try {
+      fs.mkdirSync(sperre);
+      break;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      try {
+        const alter = (Date.now() - fs.statSync(sperre).mtimeMs) / 1000;
+        if (alter > SPERRE_VERWAIST_S) {
+          // Verwaiste Sperre OWNERSHIP-sicher brechen: erst atomar wegrenamen — das
+          // gewinnt genau EIN Contender, die anderen bekommen ENOENT. So kann niemand
+          // die FRISCHE Sperre eines Prozesses loeschen, der sie inzwischen neu geholt
+          // hat (sonst saessen zwei gleichzeitig im kritischen Abschnitt).
+          const weg = sperre + '.stale-' + process.pid + '-' + Math.random().toString(36).slice(2);
+          try { fs.renameSync(sperre, weg); fs.rmdirSync(weg); } catch { /* anderer war schneller */ }
+          continue;
+        }
+      } catch { /* verschwunden während der Prüfung: nächster Versuch */ }
+      if (Date.now() >= bis) {
+        fehler(`Sperre des Laufs ${runId} ist belegt (${wartetS}s gewartet). ` +
+          'Läuft ein zweiter Schreiber? Verwaiste Sperre: ' + sperre, 75);
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+
+  gehalteneSperre = sperre;
+  try {
+    return fn();
+  } finally {
+    gehalteneSperre = null;
+    try { fs.rmdirSync(sperre); } catch { /* best effort */ }
+  }
+}
+
+/**
+ * Der Ort, an dem gearbeitet wird.
+ *
+ * Befund E der IST-Analyse vom 09.09.: `resume` lieferte eine Schrittnummer und
+ * Freitext, aber keinen Ort — kein cwd, kein Repo, kein Branch, kein Commit.
+ * Ein neuer Prozess nach einem Absturz wusste damit nicht, WO er weitermachen
+ * soll. Bei einem Nachtlauf, den niemand beobachtet, ist das der Unterschied
+ * zwischen Fortsetzen und Von-vorn-Anfangen.
+ *
+ * Best effort: kein git-Repo, kaputtes HEAD oder fehlendes git sind kein Grund,
+ * einen Checkpoint scheitern zu lassen. Buchführung darf keine Arbeit verhindern.
+ */
+function ortJetzt() {
+  const { execFileSync } = require('node:child_process');
+  const g = (...args) => {
+    try {
+      return execFileSync('git', args, {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim() || null;
+    } catch { return null; }
+  };
+  const cwd = process.cwd();
+  return {
+    cwd,
+    repo: g('rev-parse', '--show-toplevel'),
+    branch: g('rev-parse', '--abbrev-ref', 'HEAD'),
+    commit: g('rev-parse', '--short', 'HEAD'),
+    // Ob im Baum ungesicherte Arbeit liegt — nach einem Absturz die erste Frage.
+    // NICHT über g(): dessen `.trim() || null` macht aus dem leeren (= sauberen)
+    // Output null; dann waere "sauber" nie von "unbekannt" unterscheidbar. Direkt
+    // aufrufen: '' -> false (sauber), Inhalt -> true (schmutzig), Fehler -> null.
+    schmutzig: (() => {
+      try {
+        const s = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+        return s.trim().length > 0;
+      } catch { return null; }
+    })(),
+  };
+}
+
+function wartetAus(o) {
+  const n = Number(o['sperre-wartet-s']);
+  return Number.isFinite(n) && n >= 0 ? n : 10;
+}
+
+function lesenJsonl(datei) {
+  if (!fs.existsSync(datei)) return [];
+  return fs.readFileSync(datei, 'utf8').split('\n').filter(Boolean).map((z) => {
+    try { return JSON.parse(z); } catch { return { kaputt: z.slice(0, 200) }; }
+  });
+}
+
+function lesenCheckpoint(runId) {
+  const p = pfade(runId).checkpoint;
+  if (!fs.existsSync(p)) return null;
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
+}
+
+function schreibenCheckpoint(runId, cp) {
+  const p = pfade(runId);
+  fs.mkdirSync(p.dir, { recursive: true });
+  // Atomar schreiben: ein abgebrochener Schreibvorgang darf keinen halben
+  // Checkpoint hinterlassen — genau der wäre beim Wiederaufsetzen wertlos.
+  // Eindeutiger tmp-Name (pid + Zufall): so teilen sich zwei gleichzeitige
+  // Schreiber nie dieselbe tmp-Datei — die Atomaritaet des rename haengt damit
+  // NICHT mehr allein an der Lauf-Sperre (schliesst den ENOENT-Fall fuer jeden
+  // verbleibenden ungesperrten Pfad).
+  const tmp = p.checkpoint + '.' + process.pid + '.' + Math.random().toString(36).slice(2) + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(cp, null, 2) + '\n');
+  fs.renameSync(tmp, p.checkpoint);
+}
+
+// Telemetrie ueber alle Versuche eines Laufs zusammenziehen. Zahlen, die man
+// einzeln zusammensuchen muss, werden nicht gelesen.
+function telemetrieSumme(runId) {
+  const eintraege = lesenJsonl(pfade(runId).history).filter((e) => e.art === 'telemetrie');
+  const summe = { versuche: 0, kosten_usd: 0, dauer_s: 0, turns: 0, abgelehnte_rechte: 0 };
+  for (const e of eintraege) {
+    let d; try { d = JSON.parse(e.text); } catch { continue; }
+    summe.versuche += 1;
+    if (typeof d.kosten_usd === 'number') summe.kosten_usd += d.kosten_usd;
+    if (typeof d.dauer_ms === 'number') summe.dauer_s += d.dauer_ms / 1000;
+    if (typeof d.turns === 'number') summe.turns += d.turns;
+    if (typeof d.abgelehnte_rechte === 'number') summe.abgelehnte_rechte += d.abgelehnte_rechte;
+  }
+  summe.kosten_usd = Math.round(summe.kosten_usd * 10000) / 10000;
+  summe.dauer_s = Math.round(summe.dauer_s * 10) / 10;
+  return summe;
+}
+
+// ── Argumente ────────────────────────────────────────────────────────────────
+function optionen(argv) {
+  const o = {}; const rest = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i].startsWith('--')) { o[argv[i].slice(2)] = argv[i + 1]; i++; }
+    else rest.push(argv[i]);
+  }
+  return { o, rest };
+}
+
+// ── Befehle ──────────────────────────────────────────────────────────────────
+const befehle = {
+  start(argv) {
+    const { o, rest } = optionen(argv);
+    const runId = pruefeRunId(rest[0]);
+    const beschreibung = rest.slice(1).join(' ') || o.beschreibung || '';
+    // Unter der Sperre: sonst schreiben zwei gleichzeitige `start` beide den
+    // Erst-Checkpoint (read-modify-write ohne Serialisierung) — genau die
+    // Klasse Race, die der Nebenlaeufigkeits-Abschnitt oben als geschlossen zusagt.
+    const vorhanden = mitSperre(runId, wartetAus(o), () => {
+      const v = lesenCheckpoint(runId);
+      if (v) {
+        // Kein Fehler: ein zweiter start auf denselben Lauf ist der Normalfall
+        // nach einem Crash. Er darf die Historie nicht zerstören.
+        anhaengen(pfade(runId).history, { zeit: jetzt(), art: 'wiederaufnahme', schritt: v.schritt });
+        return v;
+      }
+      schreibenCheckpoint(runId, {
+        run_id: runId, beschreibung, schritt: 0, status: 'gestartet',
+        naechster_schritt: null, notiz: null, reparaturen: 0,
+        aktualisiert: jetzt(), begonnen: jetzt(), ort: ortJetzt(),
+      });
+      anhaengen(pfade(runId).history, { zeit: jetzt(), art: 'start', beschreibung });
+      return null;
+    });
+    process.stdout.write(vorhanden
+      ? `Lauf ${runId} existiert bereits — Stand: Schritt ${vorhanden.schritt}, ${vorhanden.status}\n`
+      : `Lauf ${runId} begonnen\n`);
+    return 0;
+  },
+
+  checkpoint(argv) {
+    const { o, rest } = optionen(argv);
+    const runId = pruefeRunId(rest[0]);
+    // Unter der Sperre: zwei gleichzeitige Checkpoints schreiben sonst beide den
+    // Stand, den sie beim Lesen vorfanden — der Spätere macht die Felder des
+    // Früheren rückgängig, ohne dass es jemand merkt.
+    const neu = mitSperre(runId, wartetAus(o), () => {
+      const alt = lesenCheckpoint(runId);
+      if (!alt) fehler(`kein Lauf ${runId} — erst "journal start ${runId}"`, 66);
+      const n = {
+        ...alt,
+        schritt: o.schritt !== undefined ? Number(o.schritt) : alt.schritt,
+        status: o.status || alt.status,
+        naechster_schritt: o.naechster !== undefined ? o.naechster : alt.naechster_schritt,
+        notiz: o.notiz !== undefined ? o.notiz : alt.notiz,
+        // Der Ort gehört dem LAUF, nicht dem einzelnen Aufruf: einmal bei
+        // `start` gesetzt, bleibt er. Grund: ruft ein Treiber am Ende selbst
+        // `journal checkpoint` aus SEINEM Verzeichnis auf, und schriebe der Aufruf
+        // den Ort neu, trüge der Checkpoint den Standort des Treibers statt den des
+        // Agenten — ein nachgelagertes Auswerte-Tool suchte Commits am falschen Ort.
+        ort: alt.ort || ortJetzt(),
+        aktualisiert: jetzt(),
+      };
+      testLuecke();
+      schreibenCheckpoint(runId, n);
+      return n;
+    });
+    anhaengen(pfade(runId).history, {
+      zeit: jetzt(), art: 'checkpoint', schritt: neu.schritt, status: neu.status,
+      naechster_schritt: neu.naechster_schritt, notiz: neu.notiz,
+    });
+    process.stdout.write(`Schritt ${neu.schritt} · ${neu.status}\n`);
+    return 0;
+  },
+
+  event(argv) {
+    const { o, rest } = optionen(argv);
+    const runId = pruefeRunId(rest[0]);
+    const text = rest.slice(1).join(' ');
+    if (!text) fehler('kein Text angegeben', 64);
+    anhaengen(pfade(runId).history, { zeit: jetzt(), art: o.art || 'notiz', text });
+    return 0;
+  },
+
+  // Die einzige Operation mit Gedächtnis gegen Wiederholung.
+  effect(argv) {
+    const { o, rest } = optionen(argv);
+    const runId = pruefeRunId(rest[0]);
+    if (!o.key) fehler('--key fehlt (Idempotenz-Schlüssel ist Pflicht)', 64);
+    const p = pfade(runId);
+    // Unter der Sperre: sonst finden zwei Agenten mit demselben Schlüssel beide
+    // nichts, bekommen beide exit 0 — und die Wirkung geht zweimal nach außen.
+    return mitSperre(runId, wartetAus(o), () => {
+      const schon = lesenJsonl(p.commitments).find((e) => e.key === o.key);
+      testLuecke();
+      if (schon) {
+        process.stdout.write(`bereits geschehen am ${schon.zeit}: ${schon.was || ''}\n`);
+        return 3;   // Aufrufer soll die Wirkung NICHT wiederholen
+      }
+      anhaengen(p.commitments, { zeit: jetzt(), key: o.key, was: o.was || '', run_id: runId });
+      process.stdout.write(`neu eingetragen: ${o.key}\n`);
+      return 0;
+    });
+  },
+
+  artefakt(argv) {
+    const { o, rest } = optionen(argv);
+    const runId = pruefeRunId(rest[0]);
+    if (!o.pfad) fehler('--pfad fehlt', 64);
+    anhaengen(pfade(runId).history, {
+      zeit: jetzt(), art: 'artefakt', pfad: o.pfad, von: o.von || 'unbekannt',
+    });
+    process.stdout.write(`Artefakt vermerkt: ${o.pfad}\n`);
+    return 0;
+  },
+
+  // Revise (Fig. 1-3): Reparatur ist erlaubt, aber gezaehlt — und der Zaehler
+  // liegt AUSSERHALB des Agenten. Ein Satz im Prompt ("hoechstens 3 Versuche")
+  // ist eine Bitte; ein Zaehler im Journal ist eine Grenze.
+  repair(argv) {
+    const { o, rest } = optionen(argv);
+    const runId = pruefeRunId(rest[0]);
+    // --max fail-closed validieren: ein nicht-numerischer Wert ergaebe NaN, und
+    // "versuch > NaN" ist IMMER false — das Budget waere still aufgehoben, obwohl
+    // rc4 = "Budget erschoepft" zugesichert ist. Lieber klar abbrechen.
+    let max = 3;
+    if (o.max !== undefined) {
+      max = Number(o.max);
+      if (!Number.isFinite(max) || max < 1) fehler(`ungültiges --max: ${JSON.stringify(o.max)} (positive Ganzzahl erwartet)`, 64);
+    }
+    // Unter der Sperre: ohne sie lesen zwei parallele Reparaturen denselben
+    // Stand und schreiben dieselbe Zahl — aus zwei Versuchen wird einer, und
+    // die Grenze, die dieser Zähler DARSTELLT, greift zu spät oder nie.
+    const versuch = mitSperre(runId, wartetAus(o), () => {
+      const alt = lesenCheckpoint(runId);
+      if (!alt) fehler(`kein Lauf ${runId}`, 66);
+      const n = Number(alt.reparaturen || 0) + 1;
+      testLuecke();
+      schreibenCheckpoint(runId, { ...alt, reparaturen: n, aktualisiert: jetzt() });
+      anhaengen(pfade(runId).history, {
+        zeit: jetzt(), art: 'reparatur', versuch: n, max, grund: o.grund || null,
+      });
+      return n;
+    });
+    if (versuch > max) {
+      process.stdout.write(`Reparaturbudget erschöpft: ${versuch - 1} von ${max} verbraucht\n`);
+      return 4;   // Aufrufer MUSS eskalieren statt weiterzuprobieren
+    }
+    process.stdout.write(`Reparaturversuch ${versuch} von ${max}\n`);
+    return 0;
+  },
+
+  // Escalate (Fig. 1-3): mit Spur, nicht mit Schweigen. Eine Eskalation ohne
+  // nachlesbaren Verlauf zwingt den Menschen, die Arbeit noch einmal zu machen.
+  escalate(argv) {
+    const { o, rest } = optionen(argv);
+    const runId = pruefeRunId(rest[0]);
+    const grund = o.grund || 'ohne Angabe';
+    // Unter der Sperre wie checkpoint/repair: escalate macht read-modify-write des
+    // Checkpoints; ohne Sperre koennte es das Update eines parallelen, gesperrten
+    // Schreibers ueberschreiben (Lost Update) oder mit ihm um dieselbe .tmp rennen.
+    const cp = mitSperre(runId, wartetAus(o), () => {
+      const c = lesenCheckpoint(runId);
+      if (!c) fehler(`kein Lauf ${runId}`, 66);
+      schreibenCheckpoint(runId, { ...c, status: 'eskaliert', notiz: grund, aktualisiert: jetzt() });
+      anhaengen(pfade(runId).history, { zeit: jetzt(), art: 'eskalation', grund });
+      return c;
+    });
+
+    const hist = lesenJsonl(pfade(runId).history);
+    anhaengen(path.join(STATE, 'eskalationen.jsonl'), {
+      zeit: jetzt(), run_id: runId, beschreibung: cp.beschreibung, grund,
+      schritt: cp.schritt, reparaturen: cp.reparaturen || 0,
+      spur: hist.slice(-10),
+    });
+    process.stdout.write(`eskaliert: ${runId} — ${grund}\n`);
+    return 0;
+  },
+
+  show(argv) {
+    const runId = pruefeRunId(optionen(argv).rest[0]);
+    const cp = lesenCheckpoint(runId);
+    if (!cp) fehler(`kein Lauf ${runId}`, 66);
+    const p = pfade(runId);
+    const hist = lesenJsonl(p.history);
+    const eff = lesenJsonl(p.commitments);
+    process.stdout.write(
+      `Lauf:      ${cp.run_id}\n` +
+      `Auftrag:   ${cp.beschreibung || '—'}\n` +
+      `Stand:     Schritt ${cp.schritt} · ${cp.status}\n` +
+      `Reparaturen: ${cp.reparaturen || 0}\n` +
+      `Als naechstes: ${cp.naechster_schritt || '—'}\n` +
+      (cp.notiz ? `Notiz:     ${cp.notiz}\n` : '') +
+      `Begonnen:  ${cp.begonnen}\n` +
+      `Zuletzt:   ${cp.aktualisiert}\n` +
+      `Ereignisse: ${hist.length}\n` +
+      `Wirkungen nach aussen: ${eff.length}${eff.length ? ' (' + eff.map((e) => e.key).join(', ') + ')' : ''}\n`
+    );
+    const t = telemetrieSumme(runId);
+    if (t.versuche) {
+      process.stdout.write(
+        `Aufwand:   ${t.versuche} Agentenlauf/-läufe · ${t.kosten_usd.toFixed(4)} USD · ` +
+        `${t.dauer_s} s · ${t.turns} Turns` +
+        (t.abgelehnte_rechte ? ` · ${t.abgelehnte_rechte} abgelehnte Rechte` : '') + '\n');
+    }
+    const artefakte = hist.filter((h) => h.art === 'artefakt');
+    if (artefakte.length) {
+      process.stdout.write('Artefakte:\n');
+      for (const a of artefakte) process.stdout.write(`  - ${a.pfad}  (von ${a.von})\n`);
+    }
+    return 0;
+  },
+
+  // Was ein NEUER Prozess braucht, um weiterzumachen — die Rehydrierung.
+  resume(argv) {
+    const runId = pruefeRunId(optionen(argv).rest[0]);
+    const cp = lesenCheckpoint(runId);
+    if (!cp) fehler(`kein Lauf ${runId}`, 66);
+    const hist = lesenJsonl(pfade(runId).history);
+    const letzte = hist.slice(-5);
+    const eff = lesenJsonl(pfade(runId).commitments);
+    process.stdout.write(JSON.stringify({
+      run_id: cp.run_id,
+      beschreibung: cp.beschreibung,
+      weiter_bei_schritt: cp.schritt,
+      status: cp.status,
+      naechster_schritt: cp.naechster_schritt,
+      notiz: cp.notiz,
+      reparaturen: cp.reparaturen || 0,
+      // Der Ort ist das Erste, was ein neuer Prozess braucht: eine Schrittnummer
+      // ohne Verzeichnis ist keine Anweisung. `null` heißt „nie festgehalten" —
+      // Läufe von vor dieser Änderung haben ihn nicht.
+      ort: cp.ort || null,
+      aufwand: telemetrieSumme(runId),
+      bereits_geschehen: eff.map((e) => ({ key: e.key, was: e.was })),
+      artefakte: hist.filter((h) => h.art === 'artefakt').map((a) => a.pfad),
+      letzte_ereignisse: letzte,
+    }, null, 2) + '\n');
+    return 0;
+  },
+
+
+  list() {
+    if (!fs.existsSync(RUNS)) { process.stdout.write('keine Läufe\n'); return 0; }
+    const laeufe = fs.readdirSync(RUNS).filter((n) => fs.existsSync(path.join(RUNS, n, 'checkpoint.json')));
+    if (!laeufe.length) { process.stdout.write('keine Läufe\n'); return 0; }
+    for (const l of laeufe) {
+      const cp = lesenCheckpoint(l);
+      // Eine vorhandene, aber unlesbare checkpoint.json (externer Schaden, halber
+      // Fremd-Write) darf nicht die GANZE Uebersicht crashen — genau list ist das
+      // Recovery-Kommando nach einem Absturz. Defekten Lauf ausweisen, Rest zeigen.
+      if (!cp) { process.stdout.write(`${l}  (checkpoint unlesbar)\n`); continue; }
+      const t = telemetrieSumme(l);
+      const kosten = t.versuche ? `  ${t.kosten_usd.toFixed(4)} USD` : '';
+      process.stdout.write(`${l}  Schritt ${cp.schritt}  ${cp.status}${kosten}  (${cp.aktualisiert})\n`);
+    }
+    return 0;
+  },
+};
+
+const [, , befehl, ...rest] = process.argv;
+if (!befehl || !befehle[befehl]) {
+  fehler('Aufrufe: start | checkpoint | event | effect | repair | escalate | artefakt | show | resume | list', 64);
+}
+// exitCode statt process.exit(): process.exit() beendet SOFORT und verwirft noch nicht
+// geflushtes stdout — bei grosser Ausgabe (resume/show/list) schnitte das die Ausgabe ab
+// (halbes, ungueltiges JSON). Mit exitCode laeuft Node normal aus und flusht vorher.
+process.exitCode = befehle[befehl](rest);

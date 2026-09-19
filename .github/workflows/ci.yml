@@ -1,0 +1,58 @@
+name: ci
+# Die externe Instanz: das lokale Stop-Gate stoppt Versehen, aber die HARTE Durchsetzung
+# fuer alle (auch einen entschlossenen Agenten) leistet nur eine Stelle, die die Checks
+# selbst faehrt. Diese CI ist genau das — fuer dieses Repo selbst, und zugleich die Vorlage,
+# die jedes Projekt uebernehmen kann (eine CI, die die eigene .checksrc faehrt).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    name: ${{ matrix.os }} · node ${{ matrix.node }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ['18', '20']
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash   # unter Windows: Git Bash — das Harness laeuft in bash, nicht PowerShell
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # LF-Zusage aus /.gitattributes gegenpruefen: keine Skript-/Hook-Datei darf mit CR ankommen
+      # (genau der Windows-Stolperstein — bash bricht an CRLF).
+      - name: Zeilenenden (LF)
+        run: |
+          if git grep -I -l $'\r' -- '*.sh' '*.js' bin .checksrc .checksrc.example 2>/dev/null | grep .; then
+            echo "CRLF gefunden — .gitattributes greift nicht"; exit 1
+          fi
+          echo "alle LF"
+
+      # install.sh kopiert nach ~/.claude (via node os.homedir(), NICHT $HOME — wichtig fuer Windows)
+      # und faehrt am Ende selbst den Selbsttest. Auf dem ephemeren Runner ist ~/.claude leer.
+      - name: Install (Kern) + Selbsttest
+        run: bash install.sh
+
+      - name: Install mit Opt-in-Hooks + Rueckbau
+        run: |
+          bash install.sh --with-audit --with-memory-commit
+          bash install.sh --uninstall
+
+      # Dogfood: die externe Instanz faehrt die .checksrc dieses Repos wirklich — grün = grün.
+      # Home wie die Hooks ihn finden (node os.homedir()); unter Git Bash per cygpath in einen
+      # echten POSIX-Pfad (/c/Users/...) wandeln, sonst zerlegt MSYS den C:/-Pfad im bash-Argument.
+      - name: Dogfood — checks-run gegen dieses Repo
+        run: |
+          bash install.sh >/dev/null 2>&1
+          HD="$(node -p 'require("os").homedir()')"
+          if command -v cygpath >/dev/null 2>&1; then HD="$(cygpath -u "$HD")"; fi
+          bash "$HD/.claude/bin/checks-run" .

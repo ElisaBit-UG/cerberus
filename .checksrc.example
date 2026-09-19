@@ -1,0 +1,22 @@
+#!/bin/bash
+# .checksrc.example — kopiere das als `.checksrc` in die WURZEL DEINES PROJEKTS und passe die Checks an.
+# checks-run fuehrt genau dieses Skript aus; exit 0 = gruen (du darfst "fertig" sagen), sonst rot.
+#
+# GRUNDREGEL: nur Checks, die NICHTS Gefaehrliches ausfuehren. KEIN blindes `pytest`/`npm test`, wenn Tests
+# echte Systeme anfassen (DB, Netzwerk, Keys). Lieber eine Allowlist der sicheren, schnellen Checks.
+set -u
+rc=0
+# Python portabel finden (macOS/Linux: python3; Windows/Git-Bash oft python oder py)
+PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || command -v py 2>/dev/null)"
+
+# Beispiel 1 — Syntaxpruefung ohne Ausfuehrung (sicher, schnell):
+[ -n "$PY" ] && { git ls-files -z '*.py' | while IFS= read -r -d '' f; do "$PY" -c "import sys;compile(open(sys.argv[1],'rb').read(),sys.argv[1],'exec')" "$f" || exit 1; done || rc=1; }
+while IFS= read -r -d '' f; do bash -n "$f" || rc=1; done < <(git ls-files -z '*.sh')
+
+# Beispiel 2 — Node/JS-Projekt (Skripte aus package.json):
+# command -v npm >/dev/null && { npm run --silent typecheck || rc=1; npm run --silent lint || rc=1; npm test --silent || rc=1; }
+
+# Beispiel 3 — nur AUSGEWAEHLTE, offline laufende Testdateien:
+# [ -n "$PY" ] && { "$PY" -m pytest -q tests/test_pure.py tests/test_logic.py || rc=1; }
+
+exit $rc

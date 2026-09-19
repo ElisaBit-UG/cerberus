@@ -1,0 +1,93 @@
+#!/bin/bash
+# ~/.claude/bin/checks-run — führt die Projekt-Checks aus und
+# schreibt Ausführungs-Evidenz (treeHash-gebunden) für das Stop-Gate.
+set -u
+SELF_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+case "$SELF_DIR" in /[a-zA-Z]/*) command -v cygpath >/dev/null 2>&1 && SELF_DIR="$(cygpath -m "$SELF_DIR")" ;; esac  # Git Bash: /c/... -> C:/... fuer node
+ROOT="$(cd "${1:-.}" && git rev-parse --show-toplevel 2>/dev/null)" || { echo "kein git-repo" >&2; exit 3; }
+CMDS=(); GREEN=1
+# Sub-Pakete laufen in Subshells; ein rotes Ergebnis muss den Hauptprozess erreichen.
+RCFILE="$(mktemp)"; trap 'rm -f "$RCFILE"' EXIT
+run() { echo "▶ $*"; "$@"; local rc=$?; CMDS+=("$*:rc=$rc"); [ $rc -ne 0 ] && { GREEN=0; echo "$* rc=$rc" >> "$RCFILE"; }; return $rc; }
+cd "$ROOT"
+# SICHERHEITSNETZ (Paket-Fassung 19.09.2026): KEIN blindes pytest. In Repos mit test_*.py, die Live-Systeme
+# anfassen (RPC, Datenbank, Wallet-Keys), waere `pytest -q` ueber alles gefaehrlich. Ohne `.checksrc` wird ein
+# Python-Stack deshalb fail-closed ROT, ausser HARNESS_ALLOW_BLIND_PYTEST=1 erlaubt es ausdruecklich.
+pyfind() { command -v python3 2>/dev/null || command -v python 2>/dev/null || command -v py 2>/dev/null; }
+blind_pytest() {
+  if [ "${HARNESS_ALLOW_BLIND_PYTEST:-0}" = "1" ]; then
+    local py; py="$(pyfind)" || true
+    [ -n "$py" ] || { echo "kein Python gefunden" >&2; GREEN=0; echo "python fehlt" >> "$RCFILE"; return 1; }
+    run "$py" -m pytest -q
+  else
+    echo "KEIN .checksrc: blindes pytest ist deaktiviert (Live-Tests!). .checksrc im Repo-Root anlegen" >&2
+    echo "  oder bewusst erlauben: HARNESS_ALLOW_BLIND_PYTEST=1" >&2
+    GREEN=0; echo "blind-pytest verweigert" >> "$RCFILE"; return 1
+  fi
+}
+
+# Reihenfolge: (1) `.checksrc` — das Repo sagt selbst, was „gruen" heisst (M11);
+# (2) Root-Stack; (3) bekannte Sub-Pakete eines Monorepos. Erst wenn nichts davon
+# greift, ist der Stack wirklich unbekannt und die Evidenz faellt fail-closed rot aus.
+run_node_pkg() {
+  local dir="$1" label="$2" any=0
+  ( cd "$dir" || exit 1
+    node -e 'const s=require("./package.json").scripts||{};process.exit(s.typecheck?0:1)' ) && { any=1; ( cd "$dir" && run npm run --silent typecheck ); }
+  ( cd "$dir" || exit 1
+    node -e 'const s=require("./package.json").scripts||{};process.exit(s.lint?0:1)' ) && { any=1; ( cd "$dir" && run npm run --silent lint ); }
+  ( cd "$dir" || exit 1
+    node -e 'const s=require("./package.json").scripts||{};process.exit(s.test?0:1)' ) && { any=1; ( cd "$dir" && run npm test --silent ); }
+  [ "$any" -eq 1 ] && echo "  ($label)"
+  return $((1 - any))
+}
+
+if [ -f .checksrc ]; then
+  echo "▶ .checksrc"
+  if grep -q $'\r' .checksrc; then
+    echo ".checksrc hat Windows-Zeilenenden (CRLF) - bash kann sie nicht ausfuehren. Neu auschecken (siehe /.gitattributes)." >&2
+    GREEN=0; echo "checksrc crlf" >> "$RCFILE"
+  else
+    run bash .checksrc
+  fi
+elif [ -f package.json ]; then
+  if ! run_node_pkg . "root"; then
+    echo "keine checks definiert" >&2
+    GREEN=0
+  fi
+elif [ -f Cargo.toml ]; then
+  run cargo test -q
+elif [ -f pyproject.toml ] || [ -f requirements.txt ]; then
+  blind_pytest
+else
+  # Monorepo: kein Root-Manifest, aber Sub-Pakete mit eigenen Checks (M11).
+  FOUND=0
+  for sub in backend react-src frontend server client api web packages/*; do
+    [ -d "$sub" ] || continue
+    if [ -f "$sub/.checksrc" ]; then
+      echo "▶ $sub/.checksrc"; FOUND=1; ( cd "$sub" && run bash .checksrc )
+    elif [ -f "$sub/package.json" ]; then
+      run_node_pkg "$sub" "$sub" && FOUND=1
+    elif [ -f "$sub/Cargo.toml" ]; then
+      FOUND=1; ( cd "$sub" && run cargo test -q )
+    elif [ -f "$sub/pyproject.toml" ] || [ -f "$sub/requirements.txt" ]; then
+      FOUND=1; ( cd "$sub" && blind_pytest )
+    fi
+  done
+  if [ "$FOUND" -eq 0 ]; then
+    echo "Stack unbekannt — .checksrc anlegen (Shell-Skript, exit 0 = gruen) oder Checks definieren" >&2
+    GREEN=0
+  fi
+fi
+[ -s "$RCFILE" ] && GREEN=0
+GREEN=$GREEN ROOT="$ROOT" CMDS="${CMDS[*]:-}" CR_SELF_DIR="$SELF_DIR" node -e '
+const fs=require("fs"),path=require("path"),crypto=require("crypto");
+const lib=require(path.join(process.env.CR_SELF_DIR,"..","hooks","lib","hook-io.js")); // relativ zum Script, nicht ueber $HOME
+const root=fs.realpathSync(process.env.ROOT);
+const key=crypto.createHash("sha1").update(root).digest("hex");
+const file=path.join(lib.stateDir(),"checks-evidence",key+".json");
+fs.mkdirSync(path.dirname(file),{recursive:true});
+const th=lib.treeHash(root); const g=process.env.GREEN==="1";
+fs.writeFileSync(file,JSON.stringify({root,ts:Date.now(),treeHash:th,green:g,cmds:process.env.CMDS,sig:lib.evidenceSig(root,th,g)}));
+console.log((process.env.GREEN==="1"?"✅ checks grün":"❌ checks rot")+" — evidenz: "+file);
+'
+[ "$GREEN" = "1" ] || exit 1
